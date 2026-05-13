@@ -1,45 +1,34 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from dataclasses import dataclass
-from typing import Generator, List
+from python.aios.scheduler.common import _ReqState
+from typing import Any, List
 
 import torch
 
-from ..core import Batch, Req, SamplingParams
-from ..engine.sample import Sampler
+from ..core import SamplingParams
 from .cache import CacheManager
+from .common import ScheduledBatch, _PendingReq, _ReqState
+from .decode import DecodeManager
+from .prefill import PrefillManager
 from .table import TableManager
 
 
-@dataclass
-class _ReqState:
-    """Scheduler-private per-request state."""
-
-    req: Req
-    sampler: Sampler
-    finished: bool = False
-
-
-@dataclass
-class ScheduledBatch:
-    """Scheduler -> Engine execution unit."""
-
-    batch: Batch
-    samplers: List[Sampler]  # aligned with batch.reqs
-    state_indices: List[int]  # indices into Scheduler._states
-
-
 class Scheduler:
-    """Static batch scheduler: prefill-first, then decode loop.
+    """Continuous-batching scheduler (lesson 7).
 
-    State machine per req (mini-sglang aligned):
-      - cached_len:  # tokens whose KV has been written to the paged cache
-      - device_len:  cached_len + # tokens in this extend (forward's input)
-      - Pages for the extend range [cached_len, device_len) are allocated at
-        schedule time (before forward), never after.
-      - After forward, complete_one() advances: cached_len = device_len,
-        device_len += 1. The sampled token is written at token_pool[device_len-1].
+    Composes PrefillManager + DecodeManager, aligned with mini-sglang's top-level
+    Scheduler:
+      - prefill_manager.schedule_next_batch(max_running) is tried first (admit one).
+      - decode_manager.schedule_next_batch() runs otherwise over the full running set.
+      - On completion, resources are freed immediately via _free_req_resources so that
+        a new pending request can reuse the slot / pages in the next iteration.
+
+    Deliberate simplifications vs mini-sglang (documented in the lesson docs):
+      1. bsz=1 prefill (attention kernel does not support varlen prefill yet).
+      2. No chunked prefill (long-prompt splitting deferred).
+      3. No prefix caching (CacheManager.cache_req stays commented; direct page free).
+      4. Single CUDA stream, no overlap_loop.
+      5. Single-process; requests are pushed via add_request, no IPC receive_msg.
     """
 
     def __init__(
@@ -48,141 +37,99 @@ class Scheduler:
         cache_manager: CacheManager,
         eos_token_id: int,
         device: torch.device,
+        max_running_reqs: int,
     ) -> None:
         self.table_manager = table_manager
         self.cache_manager = cache_manager
         self.eos_token_id = eos_token_id
         self.device = device
-        self._states: List[_ReqState] = []
+        self.max_running = max_running_reqs
 
-    def init_requests(
-        self,
-        all_input_ids: List[torch.Tensor],
-        params_list: List[SamplingParams],
-    ) -> None:
-        """Allocate table slot + prompt pages, write prompt tokens to token_pool."""
-        for uid, (ids, sp) in enumerate(zip(all_input_ids, params_list)):
-            table_idx = self.table_manager.allocate()
-            prompt_len = len(ids)
-
-            pages = self.cache_manager.allocate(prompt_len)
-            self.table_manager.page_table[table_idx, :prompt_len] = pages
-            self.table_manager.token_pool[table_idx, :prompt_len] = ids.to(torch.int32)
-
-            req = Req(
-                input_ids=ids,
-                cached_len=0,
-                output_len=sp.max_tokens,
-                uid=uid,
-                sampling_params=sp,
-                table_idx=table_idx,
-            )
-            self._states.append(_ReqState(req=req, sampler=Sampler(sp)))
-
-    def iter_prefill_batches(self) -> Generator[ScheduledBatch, None, None]:
-        """Group requests by prompt length, yield one prefill ScheduledBatch per group."""
-        by_len: dict[int, list[int]] = defaultdict(list)
-        for idx, state in enumerate(self._states):
-            by_len[len(state.req.input_ids)].append(idx)
-
-        for prompt_len, indices in by_len.items():
-            reqs = [self._states[i].req for i in indices]
-            samplers = [self._states[i].sampler for i in indices]
-            B = len(reqs)
-
-            input_ids = torch.stack([r.input_ids for r in reqs]).to(self.device).long()
-            positions = torch.arange(prompt_len, device=self.device).unsqueeze(0).expand(B, -1)
-            # Prompt pages were allocated in init_requests.
-            out_loc = torch.stack([
-                self.table_manager.page_table[r.table_idx, :prompt_len] for r in reqs
-            ])
-
-            batch = Batch(
-                reqs=reqs,
-                phase="prefill",
-                input_ids=input_ids,
-                positions=positions,
-                out_loc=out_loc,
-                page_table=self.table_manager.page_table,
-            )
-            yield ScheduledBatch(batch=batch, samplers=samplers, state_indices=indices)
-
-    def schedule_decode_batch(self) -> ScheduledBatch | None:
-        """Build a decode batch of all active reqs, allocating one page per req."""
-        active = [(i, s) for i, s in enumerate(self._states) if not s.finished]
-        if not active:
-            return None
-
-        indices = [i for i, _ in active]
-        reqs = [s.req for _, s in active]
-        samplers = [s.sampler for _, s in active]
-        B = len(reqs)
-
-        table_idxs = torch.tensor(
-            [r.table_idx for r in reqs], device=self.device, dtype=torch.long
+        self.decode_manager = DecodeManager(
+            cache_manager=cache_manager, table_manager=table_manager, device=device
         )
-        positions_1d = torch.tensor(
-            [r.cached_len for r in reqs], device=self.device, dtype=torch.long
+        self.prefill_manager = PrefillManager(
+            cache_manager=cache_manager,
+            table_manager=table_manager,
+            decode_manager=self.decode_manager,
+            device=device,
         )
 
-        # Allocate one page per req (this step's KV write slot, at position cached_len).
-        new_pages = self.cache_manager.allocate(B)
-        self.table_manager.page_table[table_idxs, positions_1d] = new_pages
+        self.finished: List[_ReqState] = []
+        self._next_uid = 0
 
-        # Input token = token_pool[cached_len] (written by previous step).
-        input_ids = self.table_manager.token_pool[table_idxs, positions_1d].long().unsqueeze(1)
-        positions = positions_1d.unsqueeze(1)  # (B, 1)
-        out_loc = new_pages.unsqueeze(1)  # (B, 1)
+    # --------------------------------------------------------------- admission
 
-        batch = Batch(
-            reqs=reqs,
-            phase="decode",
-            input_ids=input_ids,
-            positions=positions,
-            out_loc=out_loc,
-            page_table=self.table_manager.page_table,
+    def add_request(
+        self, input_ids: torch.Tensor, sampling_params: SamplingParams
+    ) -> int:
+        uid = self._next_uid
+        self._next_uid += 1
+        self.prefill_manager.add_one_req(
+            _PendingReq(input_ids=input_ids, sampling_params=sampling_params, uid=uid)
         )
-        return ScheduledBatch(batch=batch, samplers=samplers, state_indices=indices)
+        return uid
+
+    # -------------------------------------------------------------- scheduling
+
+    def schedule_next_batch(self) -> ScheduledBatch | None:
+        # Prefill-first policy (matches mini-sglang default).
+        return (
+            self.prefill_manager.schedule_next_batch(self.max_running)
+            or self.decode_manager.schedule_next_batch()
+        )
+
+    # ---------------------------------------------------------- post-processing
 
     def process_batch_output(
         self, scheduled: ScheduledBatch, next_tokens: torch.Tensor
     ) -> None:
-        """Advance state, write sampled token to token_pool, check termination."""
-        next_tokens = next_tokens.view(-1)
+        tokens = next_tokens.view(-1).tolist()
+        if scheduled.batch.is_prefill:
+            state = scheduled.admitted_state
+            assert state is not None, "prefill ScheduledBatch must set admitted_state"
+            self._advance(state, tokens[0])
+            if state.finished:
+                self._free_req_resources(state)
+                self.finished.append(state)
+            else:
+                self.decode_manager.add_req(state)
+        else:
+            for state, tok in zip[tuple[_ReqState, Any]](self.decode_manager.running_reqs, tokens):
+                self._advance(state, tok)
+            for state in self.decode_manager.filter_reqs():
+                self._free_req_resources(state)
+                self.finished.append(state)
 
-        for i, state_idx in enumerate(scheduled.state_indices):
-            state = self._states[state_idx]
-            req = state.req
-            tok = next_tokens[i].item()
+    def _advance(self, state: _ReqState, tok: int) -> None:
+        req = state.req
+        req.complete_one()
+        self.table_manager.token_pool[req.table_idx, req.device_len - 1] = tok
+        req.generated.append(tok)
+        hit_eos = (not req.sampling_params.ignore_eos) and (tok == self.eos_token_id)
+        if hit_eos or not req.can_decode():
+            state.finished = True
 
-            req.complete_one()
-            self.table_manager.token_pool[req.table_idx, req.device_len - 1] = tok
+    def _free_req_resources(self, state: _ReqState) -> None:
+        req = state.req
+        used_pages = self.table_manager.page_table[req.table_idx, : req.cached_len]
+        self.cache_manager._free(used_pages)
+        self.table_manager.free(req.table_idx)
 
-            hit_eos = (not req.sampling_params.ignore_eos) and (tok == self.eos_token_id)
-            if hit_eos or not req.can_decode():
-                state.finished = True
+    # -------------------------------------------------------------- inspection
 
     @property
-    def has_active_reqs(self) -> bool:
-        return any(not s.finished for s in self._states)
+    def has_work(self) -> bool:
+        return self.prefill_manager.runnable or self.decode_manager.runnable
 
-    def finalize_results(self, tokenizer) -> list[dict]:
-        """Extract output tokens, free resources, return results sorted by uid."""
-        results: list[dict] = []
-        for state in self._states:
-            req = state.req
-            prompt_len = len(req.input_ids)
-            gen_ids = self.table_manager.token_pool[
-                req.table_idx, prompt_len : req.device_len
-            ].cpu().tolist()
-            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            results.append({"text": text, "token_ids": gen_ids})
-
-            # Only [0, cached_len) pages were actually allocated/written.
-            used_pages = self.table_manager.page_table[req.table_idx, : req.cached_len]
-            self.cache_manager._free(used_pages)
-            self.table_manager.free(req.table_idx)
-
-        return [r for _, r in sorted(
-            zip(self._states, results), key=lambda x: x[0].req.uid
-        )]
+    def collect_results(self, tokenizer) -> list[dict]:
+        results = [
+            {
+                "uid": s.req.uid,
+                "token_ids": s.req.generated,
+                "text": tokenizer.decode(s.req.generated, skip_special_tokens=True),
+            }
+            for s in self.finished
+        ]
+        results.sort(key=lambda r: r["uid"])
+        return results

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, List
+from dataclasses import dataclass, field
+from typing import List
 
 import torch
 
@@ -21,17 +21,16 @@ class SamplingParams:
 
 @dataclass(eq=False)
 class Req:
-    """Per-request runtime state (mini-sglang style, simplified for lessons)."""
+    """Per-request runtime state."""
 
     input_ids: torch.Tensor
     cached_len: int
     output_len: int
     uid: int
     sampling_params: SamplingParams
-    cache_handle: Any | None = None
-    block_table: torch.Tensor | None = None
-    trace_paged_kv: bool = False
-    table_idx: int | None = None  # TableManager row index (lesson 6+)
+    table_idx: int | None = None
+    # Output tokens accumulated on-the-fly; survives immediate page free on completion.
+    generated: List[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.device_len = len(self.input_ids)

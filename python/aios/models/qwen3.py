@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -20,18 +20,9 @@ from aios.layers import (
 from .base import BaseLLMModel
 
 if TYPE_CHECKING:
-    from aios.core import Batch, Req
+    from aios.core import Batch
     from .config import ModelConfig
     from aios.kvcache import MHAKVCache
-
-
-def _short_tensor(tensor: torch.Tensor, max_items: int = 12) -> str:
-    values = tensor.detach().cpu().tolist()
-    if len(values) <= max_items:
-        return str(values)
-    head = values[: max_items // 2]
-    tail = values[-(max_items - len(head)) :]
-    return f"{head} ... {tail} (len={len(values)})"
 
 
 class Qwen3Attention(BaseOP):
@@ -55,11 +46,8 @@ class Qwen3Attention(BaseOP):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        attention_mask: torch.Tensor | None,
-        kv_cache: Any | None = None,
-        paged_kv_cache: MHAKVCache | None = None,
-        req: Req | None = None,
-        batch: Batch | None = None,
+        paged_kv_cache: MHAKVCache,
+        batch: Batch,
     ) -> torch.Tensor:
         bsz, seq_len, _ = hidden_states.shape
 
@@ -79,42 +67,9 @@ class Qwen3Attention(BaseOP):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        if paged_kv_cache is not None and batch is not None:
-            # Batched paged KV path (lesson 6: static batching)
-            return self._batched_paged_attention(
-                q, k, v, paged_kv_cache, batch, bsz, seq_len
-            )
-        elif paged_kv_cache is not None:
-            assert req is not None and req.block_table is not None, "req.block_table is required with paged_kv_cache"
-            assert bsz == 1, "Paged KV path only supports bsz=1 in current lesson path"
-            block_table = req.block_table
-
-            out_loc = block_table[req.cached_len : req.cached_len + seq_len]
-            k_to_store = k[0].transpose(0, 1)
-            v_to_store = v[0].transpose(0, 1)
-            paged_kv_cache.store_kv(k_to_store, v_to_store, out_loc, self._layer_idx)
-
-            all_locs = block_table[: req.cached_len + seq_len]
-            if req.trace_paged_kv and self._layer_idx == 0:
-                print(
-                    f"[PagedKV] store_kv req={req.uid}: "
-                    f"out_loc={_short_tensor(out_loc)}, all_locs={_short_tensor(all_locs)}"
-                )
-            k = paged_kv_cache.k_cache(self._layer_idx)[all_locs, :, 0, :].transpose(0, 1).unsqueeze(0)
-            v = paged_kv_cache.v_cache(self._layer_idx)[all_locs, :, 0, :].transpose(0, 1).unsqueeze(0)
-        elif kv_cache is not None:
-            k, v = kv_cache.update(self._layer_idx, k, v)
-
-        k = repeat_kv(k, self.num_kv_groups)
-        v = repeat_kv(v, self.num_kv_groups)
-
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self._scale
-        attn_weights = attn_weights + attention_mask
-        attn_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-        attn_output = torch.matmul(attn_probs, v)
-
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        return self.o_proj.forward(attn_output)
+        return self._batched_paged_attention(
+            q, k, v, paged_kv_cache, batch, bsz, seq_len
+        )
 
     def _batched_paged_attention(
         self,
@@ -126,7 +81,6 @@ class Qwen3Attention(BaseOP):
         bsz: int,
         seq_len: int,
     ) -> torch.Tensor:
-        """Batched paged attention for static batching (lesson 6)."""
         device = q.device
         dtype = q.dtype
         assert batch.page_table is not None
@@ -141,10 +95,10 @@ class Qwen3Attention(BaseOP):
 
         # Retrieve full KV and compute attention
         if batch.is_prefill:
-            # Prefill: all reqs same kv_len (grouped by prompt length, cached_len=0)
+            # Prefill: all reqs share the same kv_len in this batch (bsz=1 in lesson 7).
             kv_len = batch.reqs[0].cached_len + seq_len
             k_list, v_list = [], []
-            for i, req in enumerate(batch.reqs):
+            for req in batch.reqs:
                 all_locs = page_table[req.table_idx, :kv_len]
                 k_i = paged_kv_cache.k_cache(self._layer_idx)[all_locs, :, 0, :]
                 v_i = paged_kv_cache.v_cache(self._layer_idx)[all_locs, :, 0, :]
@@ -153,7 +107,6 @@ class Qwen3Attention(BaseOP):
             k_full = torch.stack(k_list)  # (B, heads, kv_len, dim)
             v_full = torch.stack(v_list)
 
-            # Standard causal mask
             q_pos = torch.arange(seq_len, device=device).unsqueeze(1)
             k_pos = torch.arange(kv_len, device=device).unsqueeze(0)
             causal_mask = torch.where(
@@ -165,7 +118,7 @@ class Qwen3Attention(BaseOP):
             # Decode: variable kv_len per request, pad to max
             max_kv_len = max(r.cached_len + 1 for r in batch.reqs)
             k_list, v_list = [], []
-            for i, req in enumerate(batch.reqs):
+            for req in batch.reqs:
                 kv_len_i = req.cached_len + 1
                 all_locs = page_table[req.table_idx, :kv_len_i]
                 k_i = paged_kv_cache.k_cache(self._layer_idx)[all_locs, :, 0, :]
@@ -174,12 +127,11 @@ class Qwen3Attention(BaseOP):
                     pad_len = max_kv_len - kv_len_i
                     k_i = F.pad(k_i, (0, 0, 0, 0, 0, pad_len))
                     v_i = F.pad(v_i, (0, 0, 0, 0, 0, pad_len))
-                k_list.append(k_i.transpose(0, 1))  # (heads, max_kv_len, dim)
+                k_list.append(k_i.transpose(0, 1))
                 v_list.append(v_i.transpose(0, 1))
-            k_full = torch.stack(k_list)  # (B, heads, max_kv_len, dim)
+            k_full = torch.stack(k_list)
             v_full = torch.stack(v_list)
 
-            # Per-request mask: unmask valid positions, mask padding
             causal_mask = torch.full(
                 (bsz, 1, 1, max_kv_len), float("-inf"), device=device, dtype=dtype
             )
@@ -203,7 +155,6 @@ class Qwen3MLP(BaseOP):
         self.gate_proj = Linear(config.hidden_size, config.intermediate_size)
         self.up_proj = Linear(config.hidden_size, config.intermediate_size)
         self.down_proj = Linear(config.intermediate_size, config.hidden_size)
-        # Dispatch activation by config (like mini-sglang GatedMLP)
         match config.hidden_act:
             case "silu":
                 self._act_fn = silu_and_mul
@@ -224,23 +175,14 @@ class Qwen3DecoderLayer(BaseOP):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        kv_cache: Any | None = None,
-        paged_kv_cache: MHAKVCache | None = None,
-        req: Req | None = None,
-        batch: Batch | None = None,
+        paged_kv_cache: MHAKVCache,
+        batch: Batch,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm.forward(hidden_states)
         hidden_states = self.self_attn.forward(
-            hidden_states,
-            position_embeddings,
-            attention_mask,
-            kv_cache=kv_cache,
-            paged_kv_cache=paged_kv_cache,
-            req=req,
-            batch=batch,
+            hidden_states, position_embeddings, paged_kv_cache, batch
         )
         hidden_states = residual + hidden_states
 
@@ -263,58 +205,15 @@ class Qwen3Model(BaseOP):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: Any | None = None,
-        paged_kv_cache: MHAKVCache | None = None,
-        req: Req | None = None,
-        batch: Batch | None = None,
+        paged_kv_cache: MHAKVCache,
+        batch: Batch,
     ) -> torch.Tensor:
-        bsz, seq_len = input_ids.shape
         hidden_states = self.embed_tokens.forward(input_ids)
-
-        if batch is not None:
-            # Batched path: use pre-computed positions from Batch
-            position_ids = batch.positions
-        elif paged_kv_cache is not None:
-            assert req is not None, "req is required with paged_kv_cache"
-            past_len = req.cached_len
-            position_ids = torch.arange(
-                past_len, past_len + seq_len, device=input_ids.device,
-            ).unsqueeze(0).expand(bsz, -1)
-        else:
-            past_len = kv_cache.get_seq_len() if kv_cache is not None else 0
-            position_ids = torch.arange(
-                past_len, past_len + seq_len, device=input_ids.device,
-            ).unsqueeze(0).expand(bsz, -1)
-
-        position_embeddings = self._rotary_emb.forward(position_ids)
-
-        # Causal mask: for batched path, attention layer builds its own mask
-        # For non-batched paths, build the standard causal mask here
-        if batch is not None:
-            causal_mask = None  # handled inside _batched_paged_attention
-        else:
-            if paged_kv_cache is not None:
-                past_len = req.cached_len  # type: ignore[union-attr]
-            else:
-                past_len = kv_cache.get_seq_len() if kv_cache is not None else 0
-            total_kv_len = past_len + seq_len
-            q_positions = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(1)
-            k_positions = torch.arange(total_kv_len, device=input_ids.device).unsqueeze(0)
-            causal_mask = torch.where(
-                k_positions > q_positions,
-                torch.tensor(float("-inf"), device=input_ids.device, dtype=hidden_states.dtype),
-                torch.tensor(0.0, device=input_ids.device, dtype=hidden_states.dtype),
-            ).unsqueeze(0).unsqueeze(0)
+        position_embeddings = self._rotary_emb.forward(batch.positions)
 
         for layer in self.layers.op_list:
             hidden_states = layer.forward(
-                hidden_states,
-                causal_mask,
-                position_embeddings,
-                kv_cache=kv_cache,
-                paged_kv_cache=paged_kv_cache,
-                req=req,
-                batch=batch,
+                hidden_states, position_embeddings, paged_kv_cache, batch
             )
         return self.norm.forward(hidden_states)
 
@@ -332,16 +231,8 @@ class Qwen3ForCausalLM(BaseLLMModel):
     def forward(
         self,
         input_ids: torch.Tensor,
-        kv_cache: Any | None = None,
-        paged_kv_cache: MHAKVCache | None = None,
-        req: Req | None = None,
-        batch: Batch | None = None,
+        paged_kv_cache: MHAKVCache,
+        batch: Batch,
     ) -> torch.Tensor:
-        hidden_states = self.model.forward(
-            input_ids,
-            kv_cache=kv_cache,
-            paged_kv_cache=paged_kv_cache,
-            req=req,
-            batch=batch,
-        )
+        hidden_states = self.model.forward(input_ids, paged_kv_cache, batch)
         return self.lm_head.forward(hidden_states)

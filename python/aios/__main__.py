@@ -3,8 +3,7 @@ CLI entry point for AIOS inference engine.
 
 Usage:
     python -m aios --model /path/to/Qwen3-0.6B --prompt "Who are you?"
-    python -m aios --model /path/to/Qwen3-0.6B --prompt "Hello" --temperature 0.8 --max-tokens 128
-    python -m aios --model /path/to/Qwen3-0.6B --prompt "Hi" --prompt "Hello" --static-batch
+    python -m aios --model /path/to/Qwen3-0.6B --prompt "Hi" --prompt "Hello" --max-running-reqs 2
 """
 
 import argparse
@@ -27,10 +26,8 @@ def main():
                         help="Top-k sampling (-1 = disabled)")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device to use (e.g. cuda, cuda:0, cuda:1)")
-    parser.add_argument("--no-kv-cache", action="store_true",
-                        help="Disable lesson-4 dynamic KV cache path")
-    parser.add_argument("--static-batch", action="store_true",
-                        help="Use lesson-6 static batching (paged KV, batched attention)")
+    parser.add_argument("--max-running-reqs", type=int, default=None,
+                        help="Cap concurrently running reqs (defaults to batch size)")
     args = parser.parse_args()
 
     prompts = args.prompt or ["Who are you?"]
@@ -47,10 +44,7 @@ def main():
         max_tokens=args.max_tokens,
     )
 
-    if args.static_batch:
-        results = llm.generate(prompts, sampling_params, use_static_batch=True)
-    else:
-        results = llm.generate(prompts, sampling_params, use_kv_cache=not args.no_kv_cache)
+    results = llm.generate(prompts, sampling_params, max_running_reqs=args.max_running_reqs)
 
     for i, r in enumerate(results):
         if len(results) > 1:

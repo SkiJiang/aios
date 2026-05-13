@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import torch
 from .base import BaseKVCache, KVCacheLayout, BaseCacheHandle, BaseCacheManager, SizeInfo
-from .dynamic import DynamicKVCache
 from .mha_pool import MHAKVCache
 from .naive_manager import NaiveCacheManager
 
@@ -15,7 +14,6 @@ __all__ = [
     "BaseCacheHandle",
     "BaseCacheManager",
     "SizeInfo",
-    "DynamicKVCache",
     "MHAKVCache",
     "NaiveCacheManager",
     "create_naive_cache_manager",
