@@ -4,6 +4,10 @@
 
 Lesson 8 已经将变长 prefill 改为 flat token，并用 FlashInfer 完成 paged attention。attention 不再是 decode 的主要瓶颈后，Qwen3 每层仍然会发射大量小算子：三次 Q/K/V GEMM、两次 gate/up GEMM、SiLU、逐元素乘法、残差加法、RMSNorm，以及两次 KV cache 的高级索引写入。
 
+<img src="../lesson-1-llm-basics/images/qwen3.png" alt="Qwen3 网络架构图" width="60%">
+
+这张架构图帮助我们把本课的优化位置放回完整模型里：融合发生在每个 `Qwen3DecoderLayer` 内部，主要覆盖 attention 的 Q/K/V 投影、MLP 的 gate/up 投影、SwiGLU 激活，以及残差加法后的 RMSNorm。
+
 这些操作本身并不复杂，但 decode 每次只处理很少 token。kernel launch、读写中间张量和重复读取输入权重会占据显著时间。
 
 本课不改变请求生命周期、page table、FlashInfer metadata 或调度策略；只替换模型层内部的计算方式。
@@ -12,45 +16,61 @@ Lesson 8 已经将变长 prefill 改为 flat token，并用 FlashInfer 完成 pa
 
 ### 1. 算子融合优化的到底是什么？
 
-融合**不改变模型数学**，也不减少 QKV / SwiGLU 的主 FLOPs；它优化的是 decode 小 batch 下更昂贵的调度和访存成本。
-
-以未融合的 QKV 为例，`x` 必须分别送进 `q_proj`、`k_proj`、`v_proj`。这意味着三次独立 GEMM：每次都要发射 kernel、从 HBM 读取 `x`，并把一份中间结果写回 HBM。SwiGLU 的 `gate_proj` 和 `up_proj` 同样重复一次。
-
-将权重沿**输出维**拼接后，输入只需要进入一次更大的 GEMM：
-
-```text
-qkv = x @ cat(Wq, Wk, Wv)^T        # [Q | K | V]
-gate_up = x @ cat(Wgate, Wup)^T    # [gate | up]
-```
-
-这带来三类收益：
-
-1. **更少 kernel launch**：Q/K/V 的 3 次 GEMM 变成 1 次，gate/up 的 2 次 GEMM 也变成 1 次。
-2. **更少中间读写**：`x` 不再被多次从 HBM 读取；gate/up 不必先分别落盘、再读回做乘法。
-3. **更好的 GEMM 利用率**：合并后的输出维更宽，GPU 更容易用足 Tensor Core，尤其适合 decode 的小 token batch。
-
 ![未融合与融合后的数据流、kernel launch 和访存差异](operator_fusion_principle.png)
 
-图中的关键不在“把三个名字放到一个盒子里”，而在于数据流从**一份输入向五个独立 kernel 扇出**，变为**两条 packed 流水线**。前者的额外成本会随每个 decode step 重复；后者将它们摊进更少的 GPU 调用。
+先看这张图。左边的未融合版本把一段连续计算拆成 `kernel A -> kernel B -> kernel C` 三个独立 GPU kernel。每个 kernel 都有自己的 tile 循环：先把输入 tile 从 DDR/HBM 读到 SRAM，计算完以后把结果写回 DDR/HBM。下一个 kernel 不能直接使用上一阶段留在片上的数据，只能再从 DDR/HBM 把中间结果读回来。
 
-### 2. 拼接的权重如何仍然得到原来的 Q、K、V？
+所以未融合的真正代价不只是“多了几个函数调用”，而是：
 
-PyTorch 的 `F.linear(x, weight)` 计算 `x @ weight.T`，权重布局为 `(output_size, input_size)`。因此“合并输出通道”就是把权重沿 `dim=0` 拼接。GEMM 的输出仍是一段连续内存，随后 `split()` 返回逻辑 view，不复制 Q/K/V 数据：
+1. **3 次 kernel launch**：A、B、C 分别调度，decode 小 batch 下 launch 开销会变得明显。
+2. **3 个独立 for-loop**：每个 kernel 都重新遍历 tile，无法把局部数据流连续接起来。
+3. **中间张量反复落盘**：`intermediate_1`、`intermediate_2` 会经历 `SRAM -> DDR/HBM -> SRAM` 的往返，浪费 HBM 带宽。
+
+右边的融合版本把 A、B、C 放进同一个 fused kernel。对于同一块 tile，数据只从 DDR/HBM 读入一次，然后在 SRAM / registers 里连续完成 `A -> B -> C`，中间结果不写回全局显存，直到最终输出才 store 回 DDR/HBM。
+
+这就是算子融合的核心：**把多个相邻算子的 tile loop 合并成一个 loop，让中间 tile 尽量留在片上存储中**。它不改变数学结果，也不一定减少主计算量；它减少的是 GPU 调度次数和 HBM 读写次数。
+
+放到本课里，Qwen3 的 decode 阶段每步 token 很少，小 kernel 和中间张量读写会被反复放大。融合后，模型层内部的局部数据流更像右图：一次读取、片上连续计算、一次写回。这个变化会在每一层、每一个 decode step 重复累积，所以即使单个算子很小，总体收益仍然明显。
+
+### 2. Merged Linear 原理
+
+Merged Linear 的核心是一个简单的线性代数等价关系：如果多个线性层共享同一个输入 `x`，就不必分别执行多次 GEMM，而是把它们的权重沿**输出维**拼在一起，执行一次更宽的 GEMM。
 
 ```text
-q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
-gate, up = gate_up.chunk(2, dim=-1)
-SwiGLU = silu(gate) * up
+y1 = x @ W1.T
+y2 = x @ W2.T
+y3 = x @ W3.T
+
+# 等价于：
+y_merged = x @ concat(W1, W2, W3).T
+y1, y2, y3 = split(y_merged)
 ```
+
+PyTorch 的 `F.linear(x, weight)` 计算 `x @ weight.T`，权重布局是 `(output_size, input_size)`。因此 merged linear 只需要把权重沿 `dim=0` 拼接；GEMM 的输出是一段连续内存，再按原始输出大小切成多个 view。这里的 `split()` 不复制数据，只是在同一块输出 buffer 上建立逻辑切片。
 
 ![LinearQKVMerged 与 LinearColParallelMerged 的真实权重布局和输出切片](merged_projection_layouts.png)
 
-对 Qwen3-0.6B：
+本课实现了两个 merged linear：
+
+- `LinearQKVMerged`：把 attention 中共享输入的 `q_proj/k_proj/v_proj` 合成一次投影，输出布局为 `[Q | K | V]`。
+- `LinearColParallelMerged`：把 MLP 中共享输入的 `gate_proj/up_proj` 合成一次投影，输出布局为 `[gate | up]`。
+
+它们对应的输出切片如下：
+
+```text
+qkv = qkv_proj(x)
+q, k, v = qkv.split([q_size, kv_size, kv_size], dim=-1)
+
+gate_up = gate_up_proj(x)
+hidden = silu_and_mul(gate_up)
+```
+
+对 Qwen3-0.6B 来说：
 
 - `q_size = 16 × 128 = 2048`，`kv_size = 8 × 128 = 1024`，故 `Wqkv` 的形状为 `(4096, 1024)`，输出为 `(T, 4096)`。
 - `Wgate_up` 的形状为 `(2 × 3072, 1024) = (6144, 1024)`；`silu_and_mul` 读取其前半部分作为 gate、后半部分作为 up，输出恢复到 `(T, 3072)`。
 
-`LinearColParallelMerged` 名称中的 *ColumnParallel* 为 Lesson 14 预留：在 tensor parallel 时，输出通道可按 rank 切分；本课单 GPU 的关键仍是先将 gate/up 的输出通道合并，再一次性计算。
+`LinearColParallelMerged` 名称中的 *ColumnParallel* 为 Lesson 14 预留：在 tensor parallel 时，输出通道可按 rank 切分。本课暂时不引入 TP，只保留 merged linear 的单 GPU 语义：共享输入读一次，输出维变宽，随后用 view 切回原来的逻辑分支。
 
 ### 3. 残差路径也可以合并
 
