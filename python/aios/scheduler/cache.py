@@ -1,78 +1,108 @@
 from __future__ import annotations
 
+from typing import List, Tuple
+
 import torch
-from aios.kvcache import create_naive_cache_manager
 
 from ..core import Req
 
 
-class CacheManager:
-    def __init__(self, device: torch.device, num_pages: int):
-        self._free_slots = torch.arange(num_pages, dtype=torch.int32, device=device)
-        self.device = device
-        self.manager = create_naive_cache_manager(device=device)
-        self.num_pages = num_pages
+def _div_ceil(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
-    def _free(self, indices: torch.Tensor) -> None:
-        if len(indices) > 0:
-            self._free_slots = torch.cat([self._free_slots, indices])
+
+class CacheManager:
+    """Allocate physical KV pages and write raw token locations to page_table.
+
+    This follows mini-sglang's page-aligned allocation path. Prefix-cache
+    matching/eviction is intentionally deferred to the prefix-caching lesson.
+    """
+
+    def __init__(
+        self,
+        num_pages: int,
+        page_size: int,
+        page_table: torch.Tensor,
+    ) -> None:
+        device = page_table.device
+        self.free_slots = (
+            torch.arange(num_pages, dtype=torch.int32, device=device) * page_size
+        )
+        self.device = device
+        self.num_pages = num_pages
+        self.page_table = page_table
+        self.page_size = page_size
 
     @property
     def available_size(self) -> int:
-        return len(self._free_slots)
+        return len(self.free_slots) * self.page_size
 
-    def allocate_paged(self, reqs: list[Req], page_table: torch.Tensor) -> None:
+    def allocate_paged(self, reqs: List[Req]) -> None:
+        needed_pages = 0
+        allocation_info: List[Tuple[int, int, int]] = []
         for req in reqs:
-            assert req.table_idx is not None
-            extend_len = req.extend_len
-            if extend_len == 0:
-                continue
-            indices = self.allocate(extend_len)
-            page_table[
-                req.table_idx,
-                req.cached_len : req.device_len,
-            ] = indices
+            first_page = _div_ceil(req.cached_len, self.page_size)
+            last_page = _div_ceil(req.device_len, self.page_size)
+            if last_page > first_page:
+                needed_pages += last_page - first_page
+                allocation_info.append((req.table_idx, first_page, last_page))
 
-    # Temporarily disabled: these methods support prefix cache handle management
-    # and integrity checks, but they are unused by the current lesson-6 paged
-    # KV path. Keep the implementation below commented for future re-enable.
-    #
-    # def lock(self, handle: BaseCacheHandle) -> None:
-    #     self.manager.lock_handle(handle, unlock=False)
-    #
-    # def unlock(self, handle: BaseCacheHandle) -> None:
-    #     self.manager.lock_handle(handle, unlock=True)
+        if needed_pages > 0:
+            allocated = self._page_to_token(self._allocate(needed_pages))
+            _write_page_table(
+                self.page_table, allocated, allocation_info, self.page_size
+            )
 
-    def allocate(self, needed_len: int) -> torch.Tensor:
-        if needed_len <= (free_len := len(self._free_slots)):
-            allocated = self._free_slots[:needed_len]
-            self._free_slots = self._free_slots[needed_len:]
-            return allocated
-        raise NotImplementedError("CacheManager eviction is not implemented.")
-        # # NOTE: len(evicted) + free_len >= needed_len
-        # evicted = self.manager.evict(needed_len - free_len)
-        # merged = torch.cat([self._free_slots, evicted])
-        # assert len(merged) >= needed_len, "Eviction did not free enough space."
+    def free_req(self, req: Req) -> None:
+        indices = self.page_table[req.table_idx, : req.cached_len]
+        self._free(indices)
 
-        # allocated = merged[:needed_len]
-        # self._free_slots = merged[needed_len:]
-        # return allocated
+    def _allocate(self, needed_pages: int) -> torch.Tensor:
+        if needed_pages > len(self.free_slots):
+            raise RuntimeError(
+                f"KV cache exhausted: need {needed_pages} pages, "
+                f"have {len(self.free_slots)}"
+            )
+        allocated = self.free_slots[:needed_pages]
+        self.free_slots = self.free_slots[needed_pages:]
+        return allocated
 
-    # def free_and_cache_finished_req(
-    #     self,
-    #     old_handle: BaseCacheHandle,
-    #     input_ids: torch.Tensor,
-    #     indices: torch.Tensor,
-    # ) -> None:
-    #     in_cache_len = self.manager.insert_prefix(input_ids, indices)
-    #     self._free(indices[old_handle.cached_len : in_cache_len])
-    #     self.unlock(old_handle)
-    #
-    # def check_integrity(self) -> None:
-    #     self.manager.check_integrity()
-    #     if len(self._free_slots) + self.manager.size_info.total_size != self.num_pages:
-    #         raise RuntimeError(
-    #             "CacheManager integrity check failed:"
-    #             f" free_slots({len(self._free_slots)}) +"
-    #             f" total_size({self.manager.size_info.total_size}) != num_pages({self.num_pages})"
-    #         )
+    def _free(self, indices: torch.Tensor) -> None:
+        if len(indices) > 0:
+            self.free_slots = torch.cat(
+                [self.free_slots, indices[:: self.page_size]]
+            )
+
+    def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
+        if self.page_size == 1:
+            return pages
+        offsets = torch.arange(
+            self.page_size, device=self.device, dtype=torch.int32
+        )
+        return (pages.unsqueeze(1) + offsets).flatten()
+
+
+def _write_page_table(
+    page_table: torch.Tensor,
+    allocated: torch.Tensor,
+    allocation_info: List[Tuple[int, int, int]],
+    page_size: int,
+) -> None:
+    needed_tokens = len(allocated)
+    table_idx_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+    positions_host = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+    offset = 0
+    for table_idx, first_page, last_page in allocation_info:
+        first_pos, last_pos = first_page * page_size, last_page * page_size
+        length = last_pos - first_pos
+        table_idx_host[offset : offset + length].fill_(table_idx)
+        torch.arange(
+            first_pos,
+            last_pos,
+            out=positions_host[offset : offset + length],
+        )
+        offset += length
+    assert offset == needed_tokens
+    table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
+    positions = positions_host.to(page_table.device, non_blocking=True)
+    page_table[table_idxs, positions] = allocated

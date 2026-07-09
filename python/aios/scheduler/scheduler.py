@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Tuple, TypeAlias
+from typing import TYPE_CHECKING, List, NamedTuple, Tuple, TypeAlias
 
 import torch
 
-from ..attention import BaseAttentionBackend
+from ..attention import BaseAttnBackend
 from ..core import Batch, Req, SamplingParams
 from .cache import CacheManager
 from .common import PendingReq
@@ -12,8 +12,17 @@ from .decode import DecodeManager
 from .prefill import PrefillManager
 from .table import TableManager
 
+if TYPE_CHECKING:
+    from aios.engine.graph import GraphRunner
+
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+
+
+class ForwardInput(NamedTuple):
+    batch: Batch
+    input_tuple: Indice2D
+    write_tuple: Indice2D
 
 
 class Scheduler:
@@ -28,7 +37,7 @@ class Scheduler:
 
     Deliberate simplifications vs mini-sglang (documented in the lesson docs):
       1. No chunked prefill (long-prompt splitting deferred).
-      2. No prefix caching (CacheManager.cache_req stays commented; direct page free).
+      2. No prefix caching (finished requests return their pages directly).
       3. Single CUDA stream, no overlap_loop.
       4. Single-process; requests are pushed via add_request, no IPC receive_msg.
     """
@@ -39,17 +48,17 @@ class Scheduler:
         cache_manager: CacheManager,
         eos_token_id: int,
         device: torch.device,
-        max_running_reqs: int,
-        attn_backend: BaseAttentionBackend,
+        attn_backend: BaseAttnBackend,
         prefill_token_budget: int | None = None,
+        graph_runner: GraphRunner | None = None,
     ) -> None:
         self.table_manager = table_manager
         self.cache_manager = cache_manager
         self.eos_token_id = eos_token_id
         self.device = device
-        self.max_running = max_running_reqs
         self.attn_backend = attn_backend
-        self.prefill_token_budget = prefill_token_budget
+        self.prefill_budget = prefill_token_budget or torch.iinfo(torch.int64).max
+        self.graph_runner = graph_runner
 
         self.decode_manager = DecodeManager(page_size=1)
         self.prefill_manager = PrefillManager(
@@ -75,41 +84,46 @@ class Scheduler:
 
     # -------------------------------------------------------------- scheduling
 
-    def schedule_next_batch(self) -> Batch | None:
+    def schedule_next_batch(self) -> ForwardInput | None:
         # Prefill-first policy (matches mini-sglang default).
         batch = (
-            self.prefill_manager.schedule_next_batch(
-                self.max_running, self.prefill_token_budget
-            )
+            self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
         return self._prepare_batch(batch) if batch else None
 
-    def _prepare_batch(self, batch: Batch) -> Batch:
-        self.cache_manager.allocate_paged(batch.reqs, self.table_manager.page_table)
+    def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        if self.graph_runner is not None:
+            self.graph_runner.pad_batch(batch)
+        else:
+            batch.padded_reqs = batch.reqs
+        self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
-        batch.input_ids = self.table_manager.token_pool[input_mapping].long()
+        write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.table_manager.page_table[input_mapping]
         self.attn_backend.prepare_metadata(batch)
-        return batch
+        return ForwardInput(batch, input_mapping, write_mapping)
 
     # ---------------------------------------------------------- post-processing
 
     def process_batch_output(
-        self, batch: Batch, next_tokens: torch.Tensor
+        self, forward_input: ForwardInput, next_tokens: torch.Tensor
     ) -> None:
-        tokens = next_tokens.view(-1).tolist()
-        for req, tok in zip(batch.reqs, tokens):
-            finished = self._advance(req, tok)
+        batch, input_mapping, write_mapping = forward_input
+        del input_mapping
+        self.table_manager.token_pool[write_mapping] = next_tokens
+        self.decode_manager.filter_reqs(batch.reqs)
+
+        next_tokens_cpu = next_tokens.to("cpu")
+        for req, next_token in zip(batch.reqs, next_tokens_cpu):
+            req.append_host(next_token.unsqueeze(0))
+            tok = int(next_token.item())
+            finished = self._is_finished(req, tok)
             if finished:
-                if batch.is_decode:
-                    self.decode_manager.remove_req(req)
+                self.decode_manager.remove_req(req)
                 self._free_req_resources(req)
                 self.finished.append(req)
-        if batch.is_prefill:
-            unfinished_reqs = [req for req in batch.reqs if req not in self.finished]
-            self.decode_manager.filter_reqs(unfinished_reqs)
 
     def debug_state(self, batch: Batch | None = None) -> str:
         return (
@@ -119,17 +133,13 @@ class Scheduler:
             f"Finished={self.finished}"
         )
 
-    def _advance(self, req: Req, tok: int) -> bool:
-        req.complete_one()
-        self.table_manager.token_pool[req.table_idx, req.device_len - 1] = tok
-        req.generated.append(tok)
+    def _is_finished(self, req: Req, tok: int) -> bool:
         hit_eos = (not req.sampling_params.ignore_eos) and (tok == self.eos_token_id)
         return hit_eos or not req.can_decode
 
     def _free_req_resources(self, req: Req) -> None:
-        used_pages = self.table_manager.page_table[req.table_idx, : req.cached_len]
+        self.cache_manager.free_req(req)
         self.table_manager.free(req.table_idx)
-        self.cache_manager._free(used_pages)
 
     # -------------------------------------------------------------- inspection
 
@@ -151,10 +161,10 @@ class Scheduler:
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(req.extend_len for req in batch.reqs)
+    needed_size = sum(req.extend_len for req in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
-    for req in batch.reqs:
+    for req in batch.padded_reqs:
         length = req.extend_len
         torch.arange(
             req.cached_len,
@@ -169,8 +179,23 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
-    for req in batch.reqs:
+    for req in batch.padded_reqs:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+
+
+def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
+    mapping_host = torch.tensor(
+        [req.table_idx for req in batch.reqs], dtype=torch.int64, pin_memory=True
+    )
+    positions_host = torch.tensor(
+        [req.device_len if req.can_decode else -1 for req in batch.reqs],
+        dtype=torch.int64,
+        pin_memory=True,
+    )
+    return (
+        mapping_host.to(device, non_blocking=True),
+        positions_host.to(device, non_blocking=True),
+    )

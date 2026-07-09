@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from aios.attention import BaseAttentionBackend, FlashInferAttentionBackend
 from aios.core import get_global_ctx
 from aios.layers import (
     BaseOP,
@@ -23,15 +22,11 @@ from aios.layers import (
 from .base import BaseLLMModel
 
 if TYPE_CHECKING:
-    from aios.core import Batch
     from .config import ModelConfig
-    from aios.kvcache import MHAKVCache
 
 
 class Qwen3Attention(BaseOP):
-    def __init__(
-        self, config: ModelConfig, layer_idx: int, attn_backend: BaseAttentionBackend
-    ):
+    def __init__(self, config: ModelConfig, layer_idx: int):
         self.num_heads = config.num_qo_heads
         self.num_kv_heads = config.num_kv_heads
         self.head_dim = config.head_dim
@@ -47,14 +42,11 @@ class Qwen3Attention(BaseOP):
 
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self._attn_backend = attn_backend
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        paged_kv_cache: MHAKVCache,
-        batch: Batch,
     ) -> torch.Tensor:
         total_tokens, _ = hidden_states.shape
         qkv = self.qkv_proj.forward(hidden_states)
@@ -69,9 +61,8 @@ class Qwen3Attention(BaseOP):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        attn_output = self._attn_backend.forward(
-            q, k, v, paged_kv_cache, self._layer_idx, batch
-        )
+        ctx = get_global_ctx()
+        attn_output = ctx.attn_backend.forward(q, k, v, self._layer_idx, ctx.batch)
         return self.o_proj.forward(attn_output.reshape(q.size(0), -1))
 
 
@@ -93,10 +84,8 @@ class Qwen3MLP(BaseOP):
 
 
 class Qwen3DecoderLayer(BaseOP):
-    def __init__(
-        self, config: ModelConfig, layer_idx: int, attn_backend: BaseAttentionBackend
-    ):
-        self.self_attn = Qwen3Attention(config, layer_idx, attn_backend)
+    def __init__(self, config: ModelConfig, layer_idx: int):
+        self.self_attn = Qwen3Attention(config, layer_idx)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
@@ -107,14 +96,10 @@ class Qwen3DecoderLayer(BaseOP):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-        paged_kv_cache: MHAKVCache,
-        batch: Batch,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self.input_layernorm.forward(hidden_states, residual)
-        hidden_states = self.self_attn.forward(
-            hidden_states, position_embeddings, paged_kv_cache, batch
-        )
+        hidden_states = self.self_attn.forward(hidden_states, position_embeddings)
         hidden_states, residual = self.post_attention_layernorm.forward(
             hidden_states, residual
         )
@@ -124,13 +109,9 @@ class Qwen3DecoderLayer(BaseOP):
 
 class Qwen3Model(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.attn_backend = FlashInferAttentionBackend(config)
         self.embed_tokens = Embedding(config.vocab_size, config.hidden_size)
         self.layers = OPList(
-            [
-                Qwen3DecoderLayer(config, i, self.attn_backend)
-                for i in range(config.num_layers)
-            ]
+            [Qwen3DecoderLayer(config, i) for i in range(config.num_layers)]
         )
         self.norm = RMSNormFused(config.hidden_size, config.rms_norm_eps)
         self._rotary_emb = RotaryEmbedding(
@@ -142,7 +123,6 @@ class Qwen3Model(BaseOP):
     ) -> torch.Tensor:
         ctx = get_global_ctx()
         input_ids = ctx.batch.input_ids
-        paged_kv_cache = ctx.kv_cache
         batch = ctx.batch
         hidden_states = self.embed_tokens.forward(input_ids)
         position_embeddings = self._rotary_emb.forward(batch.positions)
@@ -150,7 +130,7 @@ class Qwen3Model(BaseOP):
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             hidden_states, residual = layer.forward(
-                hidden_states, position_embeddings, paged_kv_cache, batch, residual
+                hidden_states, position_embeddings, residual
             )
         return self.norm.forward(hidden_states, residual)[0]
 
@@ -158,7 +138,6 @@ class Qwen3Model(BaseOP):
 class Qwen3ForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3Model(config)
-        self.attn_backend = self.model.attn_backend
         self.lm_head = LMHead(
             config.vocab_size,
             config.hidden_size,
